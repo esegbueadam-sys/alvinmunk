@@ -405,6 +405,11 @@ A direct USDC transfer from one wallet to another, with a social
 |------|-------------|
 | `i128` | `amount` — USDC stroops transferred |
 
+> **Reading it**: RPC `getEvents` topic filters only match events with exactly as many
+> topics as filter segments, so a 2-segment `['*', '*']` scan never returns `tipped`. Use a
+> 3-segment filter such as `[tipped, <from>, '*']` (`apps/web/src/lib/events.ts` →
+> `fetchTipsSent`).
+
 ### `rwd_set` (Reward Registered/Updated)
 
 An admin registers or updates a reward row in the unlock table.

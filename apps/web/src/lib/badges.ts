@@ -1,316 +1,259 @@
 /**
- * Milestone badges (Green belt, belts/04 §UX) — "BADGES THAT NAME PEOPLE".
+ * Milestone badges (Green belt, belts/04 §UX: "milestone badges auto-generated" + a
+ * badge gallery on the profile) — badges that NAME PEOPLE.
  *
- * The engine is PURE: `computeBadges(input) -> Badge[]` reads plain numbers, so it
- * is unit-testable per threshold and never touches a wallet, XP, or the treasury.
- * Everything it reads is a public Social/Earned state read (belts/08 two-track:
- * badges are pure reads, they grant nothing and unlock nothing cashable).
+ * `computeBadges(input)` is PURE: plain counts in, badge states out — no clock, no network,
+ * no copy (the gallery localizes). Every input is a public read of Social / verified state,
+ * so badges grant nothing and unlock nothing cashable (belts/08 two-track split).
  *
- * Faces over numbers: badges whose story involves another person carry a name
- * (`namedBy` — the @handle of the first voucher/tipper, or a short address).
+ * Faces over numbers: a badge tied to one person carries that person — the first voucher
+ * for First Star ("lit by @alice"), the first tip recipient for Generous.
  *
- * Data sources (all degrade gracefully — a badge row never blocks a page):
- *   - `vouch:claimed` events → inbound (backed) + outbound (vouched-for) unique edges
+ * Sources (the durable on-chain people counters are #273; until then, events):
+ *   - `vouch:claimed` events → distinct people on each side of the address
  *   - `tipped` events         → first tip sent (Generous)
- *   - get_profile             → is_verified (Verified badge), Earned XP
- *   - get_streak              → best weekly streak (Four Weeks)
- * The RPC event window is ~24h, so inbound/outbound edges persist to a localStorage
- * snapshot (same pattern as the leaderboard) and are merged on load.
+ *   - get_profile.verified    → Verified
+ *   - get_streak.best         → Four Weeks
+ * The RPC event window is ~12h, so the people seen are kept in a per-address
+ * localStorage snapshot (the leaderboard pattern) and union-merged on every load.
  */
 import { EVENTS } from '@alvinmunk/shared';
-import { fetchReputationEvents, fetchRewardsEvents } from './events';
+import type { StickerName } from './assets';
+import { fetchReputationEvents, fetchTipsSent, type RepEvent } from './events';
 import { getProfile } from './reputation';
 import { getStreak } from './quests';
 import { reverseHandle } from './registry';
-import { shortAddress } from './utils';
 
 // ── Public shapes ─────────────────────────────────────────────────────────────
 
-/** Everything the pure engine needs — no wallets, no promises, just numbers/names. */
-export interface BadgeInput {
-  /** unique people who vouched for this address (claimed half-cards) */
-  backedBy: number;
-  /** unique people this address has vouched for (claimed their half-cards) */
-  vouchedFor: number;
-  /** has ≥1 attester-verified (Earned) action happened */
-  isVerified: boolean;
-  /** best consecutive-weeks quest streak (get_streak.best) */
-  streakBest: number;
-  /** has this address sent ≥1 USDC tip */
-  tipped: boolean;
-  /** @handle of the first person who vouched this address (resolved best-effort) */
-  firstBackerName?: string;
-  /** @handle of the first person this address tipped (resolved best-effort) */
-  firstTippedName?: string;
-  /** @handle of the badge owner (used for "your" copy fallbacks) */
-  handle?: string;
+/** A person a badge names: always an address, plus their @handle when they claimed one. */
+export interface BadgePerson {
+  address: string;
+  handle: string | null;
 }
 
-export type BadgeId =
-  | 'first-star'
-  | 'connector'
-  | 'constellation'
-  | 'verified'
-  | 'four-weeks'
-  | 'generous';
+/** Everything the pure engine needs — no wallets, no promises. */
+export interface BadgeInput {
+  /** distinct people who vouched for this address (claimed half-cards) */
+  vouchedBy: number;
+  /** distinct people this address vouched for */
+  vouchedFor: number;
+  /** get_profile.verified — at least one attester-verified (Earned) action */
+  verified: boolean;
+  /** get_streak.best — best run of consecutive quest weeks */
+  streakBest: number;
+  /** has sent at least one USDC tip */
+  tipped: boolean;
+  /** the first person who vouched for this address, when known */
+  firstVoucher?: BadgePerson;
+  /** the first person this address tipped, when known */
+  firstTipTo?: BadgePerson;
+}
+
+export type BadgeId = 'firstStar' | 'connector' | 'constellation' | 'verified' | 'fourWeeks' | 'generous';
+
+/** Where a badge's next step happens — FOCUS_MODE hides everything but `social`. */
+export type BadgeSurface = 'social' | 'quests' | 'tips';
 
 export interface Badge {
   id: BadgeId;
-  /** Short display name, e.g. "Connector". */
-  name: string;
-  /** Milestone sentence, name-the-person when known: "vouched for 5 people". */
-  description: string;
   earned: boolean;
-  /** Sticker-asset key (lib/assets STICKER / STATE) rendering the badge face. */
-  sticker: string;
-  /** For a person-tied badge: WHO made it happen ("First star — lit by @alice"). */
-  namedBy?: string;
-  /** The remaining step when locked: "2 more vouches". */
-  nextStep?: string;
+  sticker: StickerName;
+  surface: BadgeSurface;
+  /** Count milestones: the threshold ("vouched for 5 people"). */
+  target?: number;
+  /** Count milestones while locked: steps left ("2 more people to back"). */
+  remaining?: number;
+  /** Person-tied badges once earned: who made it happen ("lit by @alice"). */
+  person?: BadgePerson;
 }
 
 // ── The catalog (thresholds) ──────────────────────────────────────────────────
 
 export const THRESHOLDS = {
-  CONNECTOR_BACKED: 5,
-  CONSTELLATION_VOUCHED_BY: 10,
-  FOUR_WEEKS_STREAK: 4,
+  CONNECTOR: 5,
+  CONSTELLATION: 10,
+  FOUR_WEEKS: 4,
 } as const;
 
-/**
- * PURE — the whole badge engine. Deterministic in `input`; no clock, no network,
- * no side effects. Ordered so the next-to-earn social badge comes first (the
- * pull-toward-the-next-milestone UX, belts/04 "almost there" state).
- */
+function countBadge(
+  id: BadgeId,
+  sticker: StickerName,
+  surface: BadgeSurface,
+  have: number,
+  target: number,
+): Badge {
+  const earned = have >= target;
+  return { id, sticker, surface, earned, target, remaining: earned ? undefined : target - have };
+}
+
+/** PURE — the whole badge engine, in a fixed catalog order. */
 export function computeBadges(input: BadgeInput): Badge[] {
-  const badges: Badge[] = [];
-
-  // First Star — the first claimed vouch you RECEIVED (someone backed you).
-  // This is the one badge that must name its person: "First star — lit by @alice".
-  badges.push({
-    id: 'first-star',
-    name: 'First Star',
-    description: input.firstBackerName
-      ? `lit by @${input.firstBackerName}`
-      : 'your first vouch received',
-    earned: input.backedBy >= 1,
-    sticker: 'star-lime',
-    namedBy: input.backedBy >= 1 ? input.firstBackerName : undefined,
-    nextStep: 'receive your first vouch',
-  });
-
-  // Connector — vouched FOR people (giving, not receiving; matches quest copy
-  // "rewards backing others, not just being backed").
-  const toConnector = THRESHOLDS.CONNECTOR_BACKED - input.vouchedFor;
-  badges.push({
-    id: 'connector',
-    name: 'Connector',
-    description: `vouched for ${THRESHOLDS.CONNECTOR_BACKED} people`,
-    earned: input.vouchedFor >= THRESHOLDS.CONNECTOR_BACKED,
-    sticker: 'hand-shake',
-    nextStep: toConnector > 0 ? `${toConnector} more vouch${toConnector === 1 ? '' : 'es'}` : undefined,
-  });
-
-  // Constellation — vouched BY people (the inbound milestone).
-  const toConstellation = THRESHOLDS.CONSTELLATION_VOUCHED_BY - input.backedBy;
-  badges.push({
-    id: 'constellation',
-    name: 'Constellation',
-    description: `vouched by ${THRESHOLDS.CONSTELLATION_VOUCHED_BY} people`,
-    earned: input.backedBy >= THRESHOLDS.CONSTELLATION_VOUCHED_BY,
-    sticker: 'star-arc',
-    nextStep:
-      toConstellation > 0
-        ? `${toConstellation} more vouch${toConstellation === 1 ? '' : 'es'}`
-        : undefined,
-  });
-
-  // Verified — the first attester-verified (Earned) action. Earned track only:
-  // Social XP can never unlock this badge (two-track, belts/08).
-  badges.push({
-    id: 'verified',
-    name: 'Verified',
-    description: 'first verified action',
-    earned: input.isVerified,
-    sticker: 'stamp-verified',
-    nextStep: 'complete a verified quest',
-  });
-
-  // Four Weeks — a 4-week best streak on the weekly quests.
-  const toFour = THRESHOLDS.FOUR_WEEKS_STREAK - input.streakBest;
-  badges.push({
-    id: 'four-weeks',
-    name: 'Four Weeks',
-    description: `${THRESHOLDS.FOUR_WEEKS_STREAK}-week best streak`,
-    earned: input.streakBest >= THRESHOLDS.FOUR_WEEKS_STREAK,
-    sticker: 'stamp-strip',
-    nextStep: toFour > 0 ? `${toFour} more week${toFour === 1 ? '' : 's'}` : undefined,
-  });
-
-  // Generous — the first USDC tip SENT (a social act on the tip rail, not a payout).
-  badges.push({
-    id: 'generous',
-    name: 'Generous',
-    description: input.firstTippedName ? `first tip — to @${input.firstTippedName}` : 'sent your first tip',
-    earned: input.tipped,
-    sticker: 'ticker-coin',
-    namedBy: input.tipped ? input.firstTippedName : undefined,
-    nextStep: 'send your first tip',
-  });
-
-  return badges;
+  const lit = input.vouchedBy >= 1;
+  return [
+    // First Star — the first claimed vouch RECEIVED, named after whoever lit it.
+    { id: 'firstStar', sticker: 'star-lime', surface: 'social', earned: lit, person: lit ? input.firstVoucher : undefined },
+    // Connector — vouched FOR 5 people (giving, not receiving).
+    countBadge('connector', 'hand-shake', 'social', input.vouchedFor, THRESHOLDS.CONNECTOR),
+    // Constellation — vouched BY 10 people.
+    countBadge('constellation', 'star-arc', 'social', input.vouchedBy, THRESHOLDS.CONSTELLATION),
+    // Verified — the first attester-verified action. Social activity can never earn it.
+    { id: 'verified', sticker: 'stamp-verified', surface: 'quests', earned: input.verified },
+    // Four Weeks — a 4-week best streak on the weekly quests.
+    countBadge('fourWeeks', 'stamp-strip', 'quests', input.streakBest, THRESHOLDS.FOUR_WEEKS),
+    // Generous — the first USDC tip SENT, named after its recipient.
+    { id: 'generous', sticker: 'ticker-coin', surface: 'tips', earned: input.tipped, person: input.tipped ? input.firstTipTo : undefined },
+  ];
 }
 
-/** Earned badges only, in catalog order. */
-export function earnedBadges(badges: Badge[]): Badge[] {
-  return badges.filter((b) => b.earned);
+/**
+ * FOCUS_MODE hides the quests + tips surface (belts/08), so a LOCKED badge whose next step
+ * lives there would be a dead end. Earned badges always stay — they are facts.
+ */
+export function visibleBadges(badges: Badge[], focusMode: boolean): Badge[] {
+  return focusMode ? badges.filter((b) => b.earned || b.surface === 'social') : badges;
 }
 
-// ── Event fold (pure) ─────────────────────────────────────────────────────────
+// ── Event folds (pure) ────────────────────────────────────────────────────────
 
-/** Pure fold of reputation events into unique vouch-edge counts for one address. */
-export function foldVouchEdges(
-  events: { topics: unknown[]; data: unknown }[],
-  address: string,
-): { backedBy: number; vouchedFor: number; firstBacker?: string } {
-  const backed = new Set<string>();
-  const vouched = new Set<string>();
-  // Events are oldest-first, so the FIRST edge seen for each direction is the
-  // earliest one in the window — the person who lit the first star.
-  let firstBacker: string | undefined;
+type ChainEvent = Pick<RepEvent, 'topics' | 'data'>;
+
+/** The people on each side of one address, as seen in some event window. */
+export interface VouchEdges {
+  vouchedBy: string[];
+  vouchedFor: string[];
+  /** earliest voucher seen (events are oldest-first) */
+  firstVoucher?: string;
+}
+
+/**
+ * Fold `vouch:claimed` events — data (vouch_id, from, claimer) — into the DISTINCT people
+ * who vouched for `address` and whom it vouched for. A repeated pair counts once, like the
+ * contract's first-pair-only XP.
+ */
+export function foldVouchEdges(events: ChainEvent[], address: string): VouchEdges {
+  const by = new Set<string>();
+  const vouchedFor = new Set<string>();
+  let firstVoucher: string | undefined;
   for (const { topics, data } of events) {
     if (topics[0] !== EVENTS.VOUCH || topics[1] !== 'claimed') continue;
     if (!Array.isArray(data) || data.length < 3) continue;
     const from = String(data[1]);
     const claimer = String(data[2]);
-    if (claimer === from) continue; // self-vouches are rejected on-chain; belt & braces
+    if (from === claimer) continue; // rejected on-chain (SelfVouch); belt and braces
     if (claimer === address) {
-      backed.add(from);
-      if (!firstBacker && from !== address) firstBacker = from;
+      by.add(from);
+      firstVoucher ??= from;
     } else if (from === address) {
-      vouched.add(claimer);
+      vouchedFor.add(claimer);
     }
   }
-  return { backedBy: backed.size, vouchedFor: vouched.size, firstBacker };
+  return { vouchedBy: [...by], vouchedFor: [...vouchedFor], firstVoucher };
 }
 
-/** Pure fold of rewards events into "has this address sent a tip (and to whom first)".
- *  Canonical tipped shape: topics ('tipped', from, to) · data amount (packages/shared). */
-export function foldTips(
-  events: { topics: unknown[]; data: unknown }[],
-  address: string,
-): { tipped: boolean; firstRecipient?: string } {
-  let tipped = false;
-  let firstRecipient: string | undefined;
+/** Fold `tipped` events — topics ('tipped', from, to) — into "has `address` tipped, and whom first". */
+export function foldTips(events: ChainEvent[], address: string): { tipped: boolean; firstTipTo?: string } {
   for (const { topics } of events) {
-    if (topics[0] !== EVENTS.TIPPED || topics.length < 3) continue;
-    const from = String(topics[1]);
-    if (from !== address) continue;
-    if (!tipped) firstRecipient = String(topics[2]);
-    tipped = true;
+    if (topics[0] === EVENTS.TIPPED && topics.length >= 3 && String(topics[1]) === address) {
+      return { tipped: true, firstTipTo: String(topics[2]) };
+    }
   }
-  return { tipped, firstRecipient };
+  return { tipped: false };
 }
 
-// ── Snapshot (RPC events are ephemeral; scores survive the window) ────────────
+// ── Snapshot (RPC events are ephemeral; the people seen are not) ──────────────
 
-const SNAPSHOT_KEY = 'alvinmunk.badges.snapshot';
-
-interface BadgeSnapshot {
-  backedBy: number;
-  vouchedFor: number;
+/** Everything this browser has seen for ONE address. */
+export interface BadgeSnapshot extends VouchEdges {
   tipped: boolean;
-  firstBacker?: string;
-  firstTippedName?: string;
-  /** best-known values; a fresh window can only ADD edges, never remove them */
+  firstTipTo?: string;
 }
 
-function loadSnapshot(): Partial<BadgeSnapshot> {
-  if (typeof localStorage === 'undefined') return {};
-  try {
-    return JSON.parse(localStorage.getItem(SNAPSHOT_KEY) ?? '{}') as Partial<BadgeSnapshot>;
-  } catch {
-    return {};
-  }
-}
+const SNAPSHOT_PREFIX = 'alvinmunk.badges.';
 
-function saveSnapshot(s: BadgeSnapshot): void {
-  if (typeof localStorage === 'undefined') return;
-  try {
-    localStorage.setItem(SNAPSHOT_KEY, JSON.stringify(s));
-  } catch {
-    // localStorage blocked (private mode) — badges still render from the live window
-  }
-}
+const union = (a: string[], b: string[]) => [...new Set([...a, ...b])];
 
-/** Monotone merge: a fresh event window can only add unique edges, never remove. */
-export function mergeBadgeSnapshot(
-  fresh: { backedBy: number; vouchedFor: number; tipped: boolean; firstBacker?: string; firstTippedName?: string },
-  prev: Partial<BadgeSnapshot> = {},
-): BadgeSnapshot {
+/**
+ * Merge a fresh window into what was seen before: people are only ever added, and the
+ * first voucher / first tip recipient seen EARLIER stays first (a later window's "first"
+ * is just its oldest event).
+ */
+export function mergeBadgeSnapshot(prev: BadgeSnapshot | null, fresh: BadgeSnapshot): BadgeSnapshot {
+  if (!prev) return fresh;
   return {
-    backedBy: Math.max(fresh.backedBy, prev.backedBy ?? 0),
-    vouchedFor: Math.max(fresh.vouchedFor, prev.vouchedFor ?? 0),
-    tipped: fresh.tipped || Boolean(prev.tipped),
-    // Prefer whichever name is present; fresh wins if both have one (newest first star).
-    firstBacker: fresh.firstBacker ?? prev.firstBacker,
-    firstTippedName: fresh.firstTippedName ?? prev.firstTippedName,
+    vouchedBy: union(prev.vouchedBy, fresh.vouchedBy),
+    vouchedFor: union(prev.vouchedFor, fresh.vouchedFor),
+    firstVoucher: prev.firstVoucher ?? fresh.firstVoucher,
+    tipped: prev.tipped || fresh.tipped,
+    firstTipTo: prev.firstTipTo ?? fresh.firstTipTo,
   };
 }
 
-// ── Name resolution (faces over numbers) ──────────────────────────────────────
+const isStrings = (v: unknown): v is string[] => Array.isArray(v) && v.every((x) => typeof x === 'string');
+const optString = (v: unknown) => (typeof v === 'string' ? v : undefined);
 
-/** Reverse-resolve an address to @handle, falling back to GABC…WXYZ. */
-async function nameOf(address: string | undefined): Promise<string | undefined> {
-  if (!address) return undefined;
-  const handle = await reverseHandle(address).catch(() => null);
-  return handle ?? shortAddress(address);
+/** The snapshot for `address`, or null when absent, unreadable, or not in the current shape. */
+export function readBadgeSnapshot(address: string): BadgeSnapshot | null {
+  try {
+    const raw = JSON.parse(localStorage.getItem(SNAPSHOT_PREFIX + address) ?? 'null') as Record<string, unknown> | null;
+    if (!raw || !isStrings(raw.vouchedBy) || !isStrings(raw.vouchedFor)) return null;
+    return {
+      vouchedBy: raw.vouchedBy,
+      vouchedFor: raw.vouchedFor,
+      firstVoucher: optString(raw.firstVoucher),
+      tipped: raw.tipped === true,
+      firstTipTo: optString(raw.firstTipTo),
+    };
+  } catch {
+    return null; // storage blocked or corrupt — the live window still renders
+  }
+}
+
+function writeBadgeSnapshot(address: string, s: BadgeSnapshot): void {
+  try {
+    localStorage.setItem(SNAPSHOT_PREFIX + address, JSON.stringify(s));
+  } catch {
+    // storage blocked (private mode) — badges still render from the live window
+  }
 }
 
 // ── The one async entry point the UI calls ────────────────────────────────────
 
+async function personOf(address: string | undefined): Promise<BadgePerson | undefined> {
+  if (!address) return undefined;
+  return { address, handle: await reverseHandle(address).catch(() => null) };
+}
+
 /**
- * Gather on-chain state for `address` and compute its badges. Every source fails
- * soft (contract not deployed / RPC down → that signal reads as 0/false) so a
- * badge row NEVER breaks a page. Best-effort resolves the first backer/tippee to
- * @handles; falls back to short addresses.
+ * Read everything the badges need for `address` — the PROFILE OWNER, never the viewer —
+ * and compute them. All reads run in parallel and reuse what the page is already fetching:
+ * the event scan and get_profile are shared with concurrent callers, and the tip read is
+ * filtered to this sender on the RPC side. The event and streak reads fail soft; a failed
+ * get_profile rejects, so the gallery shows an error instead of fake all-locked badges.
  */
 export async function getBadges(address: string): Promise<Badge[]> {
-  const [repEvents, tipEvents] = await Promise.all([
-    fetchReputationEvents().catch(() => []),
-    fetchRewardsEvents().catch(() => []),
+  const [events, tips, profile, streak] = await Promise.all([
+    fetchReputationEvents(),
+    fetchTipsSent(address),
+    getProfile(address),
+    getStreak(address).catch(() => ({ best: 0 })),
   ]);
 
-  const edges = foldVouchEdges(repEvents, address);
-  const tips = foldTips(tipEvents, address);
+  const seen = mergeBadgeSnapshot(readBadgeSnapshot(address), {
+    ...foldVouchEdges(events, address),
+    ...foldTips(tips, address),
+  });
+  writeBadgeSnapshot(address, seen);
 
-  // Persist the monotone union so badges survive the ~24h RPC event window.
-  const snapshot = mergeBadgeSnapshot(
-    {
-      backedBy: edges.backedBy,
-      vouchedFor: edges.vouchedFor,
-      tipped: tips.tipped,
-      firstBacker: edges.firstBacker,
-      firstTippedName: tips.firstRecipient,
-    },
-    loadSnapshot(),
-  );
-  saveSnapshot(snapshot);
-
-  const [profile, streak, firstBackerName, firstTippedName] = await Promise.all([
-    getProfile(address).catch(() => ({ social: 0, earned: 0, verified: false })),
-    getStreak(address, address).catch(() => ({ weeks: 0, best: 0, lastWeek: 0 })),
-    nameOf(snapshot.firstBacker),
-    nameOf(snapshot.firstTippedName),
-  ]);
+  const [firstVoucher, firstTipTo] = await Promise.all([personOf(seen.firstVoucher), personOf(seen.firstTipTo)]);
 
   return computeBadges({
-    backedBy: snapshot.backedBy,
-    vouchedFor: snapshot.vouchedFor,
-    isVerified: profile.verified,
+    vouchedBy: seen.vouchedBy.length,
+    vouchedFor: seen.vouchedFor.length,
+    verified: profile.verified,
     streakBest: streak.best,
-    tipped: snapshot.tipped,
-    firstBackerName,
-    firstTippedName,
+    tipped: seen.tipped,
+    firstVoucher,
+    firstTipTo,
   });
 }

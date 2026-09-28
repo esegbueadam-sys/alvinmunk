@@ -1,299 +1,307 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { EVENTS } from '@alvinmunk/shared';
+
+const { fetchReputationEventsMock, fetchTipsSentMock, getProfileMock, getStreakMock, reverseHandleMock } =
+  vi.hoisted(() => ({
+    fetchReputationEventsMock: vi.fn(),
+    fetchTipsSentMock: vi.fn(),
+    getProfileMock: vi.fn(),
+    getStreakMock: vi.fn(),
+    reverseHandleMock: vi.fn(),
+  }));
+
+vi.mock('./events', () => ({
+  fetchReputationEvents: fetchReputationEventsMock,
+  fetchTipsSent: fetchTipsSentMock,
+}));
+vi.mock('./reputation', () => ({ getProfile: getProfileMock }));
+vi.mock('./quests', () => ({ getStreak: getStreakMock }));
+vi.mock('./registry', () => ({ reverseHandle: reverseHandleMock }));
+
 import {
   computeBadges,
-  earnedBadges,
+  visibleBadges,
   foldVouchEdges,
   foldTips,
   mergeBadgeSnapshot,
+  readBadgeSnapshot,
+  getBadges,
   THRESHOLDS,
+  type Badge,
+  type BadgeId,
   type BadgeInput,
 } from './badges';
 
-// ── computeBadges — pure, per-threshold ───────────────────────────────────────
+const EMPTY: BadgeInput = { vouchedBy: 0, vouchedFor: 0, verified: false, streakBest: 0, tipped: false };
+const find = (badges: Badge[], id: BadgeId) => badges.find((b) => b.id === id)!;
+const alice = { address: 'GALICE', handle: 'alice' };
 
-const EMPTY: BadgeInput = {
-  backedBy: 0,
-  vouchedFor: 0,
-  isVerified: false,
-  streakBest: 0,
-  tipped: false,
-};
+// ── computeBadges — pure, per threshold ───────────────────────────────────────
 
 describe('computeBadges', () => {
-  it('gives a fresh wallet six locked badges with next steps', () => {
+  it('gives a fresh wallet the six badges, all locked, in catalog order', () => {
     const badges = computeBadges(EMPTY);
     expect(badges.map((b) => b.id)).toEqual([
-      'first-star',
+      'firstStar',
       'connector',
       'constellation',
       'verified',
-      'four-weeks',
+      'fourWeeks',
       'generous',
     ]);
-    for (const b of badges) {
-      expect(b.earned).toBe(false);
-      expect(b.nextStep).toBeTruthy();
-    }
+    expect(badges.every((b) => !b.earned)).toBe(true);
+    expect(badges.every((b) => b.person === undefined)).toBe(true);
   });
 
   it('is deterministic (pure): same input, same output', () => {
-    const a = computeBadges({ ...EMPTY, backedBy: 3 });
-    const b = computeBadges({ ...EMPTY, backedBy: 3 });
-    expect(a).toEqual(b);
+    expect(computeBadges({ ...EMPTY, vouchedBy: 3 })).toEqual(computeBadges({ ...EMPTY, vouchedBy: 3 }));
   });
 
-  it('locks everything at threshold-1 (except First Star, already earned by then)', () => {
-    const badges = computeBadges({
-      backedBy: THRESHOLDS.CONSTELLATION_VOUCHED_BY - 1,
-      vouchedFor: THRESHOLDS.CONNECTOR_BACKED - 1,
-      isVerified: false,
-      streakBest: THRESHOLDS.FOUR_WEEKS_STREAK - 1,
-      tipped: false,
+  it('awards First Star on the first vouch received and names who lit it', () => {
+    expect(find(computeBadges({ ...EMPTY, firstVoucher: alice }), 'firstStar')).toMatchObject({
+      earned: false,
+      person: undefined, // nobody is named on a locked badge
     });
-    // First Star unlocked long ago (backedBy ≥ 1); every other badge still locked.
-    expect(badges.find((b) => b.id === 'first-star')!.earned).toBe(true);
-    const rest = badges.filter((b) => b.id !== 'first-star');
-    expect(rest.every((b) => !b.earned)).toBe(true);
-    // Remaining steps count down correctly (faces over numbers, but numbers still honest)
-    const connector = badges.find((b) => b.id === 'connector')!;
-    expect(connector.nextStep).toBe('1 more vouch');
-    const four = badges.find((b) => b.id === 'four-weeks')!;
-    expect(four.nextStep).toBe('1 more week');
+    expect(find(computeBadges({ ...EMPTY, vouchedBy: 1, firstVoucher: alice }), 'firstStar')).toMatchObject({
+      earned: true,
+      person: alice,
+    });
   });
 
-  it('awards First Star on the first vouch received and NAMES the backer', () => {
-    const badges = computeBadges({ ...EMPTY, backedBy: 1, firstBackerName: 'alice' });
-    const first = badges.find((b) => b.id === 'first-star')!;
-    expect(first.earned).toBe(true);
-    expect(first.namedBy).toBe('alice');
-    expect(first.description).toContain('@alice');
+  it('awards Connector at vouchedFor = 5 (people BACKED), counting down before it', () => {
+    const at = (vouchedFor: number) => find(computeBadges({ ...EMPTY, vouchedFor }), 'connector');
+    expect(at(0)).toMatchObject({ earned: false, remaining: 5, target: THRESHOLDS.CONNECTOR });
+    expect(at(4)).toMatchObject({ earned: false, remaining: 1 });
+    expect(at(5)).toMatchObject({ earned: true, remaining: undefined, target: 5 });
+    expect(at(9)).toMatchObject({ earned: true, remaining: undefined });
+    // Being vouched BY people never counts toward Connector.
+    expect(find(computeBadges({ ...EMPTY, vouchedBy: 50 }), 'connector').earned).toBe(false);
   });
 
-  it('awards Connector at vouchedFor = 5 with the milestone copy', () => {
-    const at4 = computeBadges({ ...EMPTY, vouchedFor: 4 }).find((b) => b.id === 'connector')!;
-    const at5 = computeBadges({ ...EMPTY, vouchedFor: 5 }).find((b) => b.id === 'connector')!;
-    expect(at4.earned).toBe(false);
-    expect(at4.nextStep).toBe('1 more vouch');
-    expect(at5.earned).toBe(true);
-    expect(at5.description).toBe('vouched for 5 people');
-    // Past the threshold there is no next step.
-    expect(computeBadges({ ...EMPTY, vouchedFor: 9 }).find((b) => b.id === 'connector')!.nextStep).toBeUndefined();
+  it('awards Constellation at vouchedBy = 10 (people who vouched for you)', () => {
+    const at = (vouchedBy: number) => find(computeBadges({ ...EMPTY, vouchedBy }), 'constellation');
+    expect(at(9)).toMatchObject({ earned: false, remaining: 1, target: THRESHOLDS.CONSTELLATION });
+    expect(at(10)).toMatchObject({ earned: true, remaining: undefined });
+    expect(find(computeBadges({ ...EMPTY, vouchedFor: 50 }), 'constellation').earned).toBe(false);
   });
 
-  it('awards Constellation at backedBy = 10', () => {
-    const at9 = computeBadges({ ...EMPTY, backedBy: 9 }).find((b) => b.id === 'constellation')!;
-    const at10 = computeBadges({ ...EMPTY, backedBy: 10 }).find((b) => b.id === 'constellation')!;
-    expect(at9.earned).toBe(false);
-    expect(at9.nextStep).toBe('1 more vouch');
-    expect(at10.earned).toBe(true);
-    expect(at10.description).toBe('vouched by 10 people');
+  it('awards Verified only from the verified (Earned) flag — Social activity never earns it', () => {
+    expect(find(computeBadges({ ...EMPTY, vouchedBy: 20, vouchedFor: 20 }), 'verified').earned).toBe(false);
+    expect(find(computeBadges({ ...EMPTY, verified: true }), 'verified').earned).toBe(true);
   });
 
-  it('awards Verified only from the Earned (verified) track', () => {
-    // High Social XP is irrelevant — the two-track split (belts/08) holds.
-    const social = computeBadges({ ...EMPTY, backedBy: 20, vouchedFor: 20 });
-    expect(social.find((b) => b.id === 'verified')!.earned).toBe(false);
-    const verified = computeBadges({ ...EMPTY, isVerified: true }).find(
-      (b) => b.id === 'verified',
-    )!;
-    expect(verified.earned).toBe(true);
-  });
-
-  it('awards Four Weeks at streakBest = 4', () => {
-    const at3 = computeBadges({ ...EMPTY, streakBest: 3 }).find((b) => b.id === 'four-weeks')!;
-    const at4 = computeBadges({ ...EMPTY, streakBest: 4 }).find((b) => b.id === 'four-weeks')!;
-    expect(at3.earned).toBe(false);
-    expect(at4.earned).toBe(true);
+  it('awards Four Weeks at a best streak of 4', () => {
+    const at = (streakBest: number) => find(computeBadges({ ...EMPTY, streakBest }), 'fourWeeks');
+    expect(at(3)).toMatchObject({ earned: false, remaining: 1, target: THRESHOLDS.FOUR_WEEKS });
+    expect(at(4)).toMatchObject({ earned: true, remaining: undefined });
   });
 
   it('awards Generous on the first tip SENT and names the recipient', () => {
-    const locked = computeBadges(EMPTY).find((b) => b.id === 'generous')!;
-    expect(locked.earned).toBe(false);
-    const tipped = computeBadges({ ...EMPTY, tipped: true, firstTippedName: 'bob' }).find(
-      (b) => b.id === 'generous',
-    )!;
-    expect(tipped.earned).toBe(true);
-    expect(tipped.description).toBe('first tip — to @bob');
+    const bob = { address: 'GBOB', handle: null };
+    expect(find(computeBadges(EMPTY), 'generous').earned).toBe(false);
+    expect(find(computeBadges({ ...EMPTY, tipped: true, firstTipTo: bob }), 'generous')).toMatchObject({
+      earned: true,
+      person: bob,
+    });
+  });
+});
+
+describe('visibleBadges', () => {
+  const badges = computeBadges({ ...EMPTY, verified: true });
+
+  it('shows everything outside FOCUS_MODE', () => {
+    expect(visibleBadges(badges, false)).toHaveLength(6);
   });
 
-  it('earnedBadges filters to earned only, in catalog order', () => {
-    const badges = computeBadges({ ...EMPTY, backedBy: 1, tipped: true });
-    expect(earnedBadges(badges).map((b) => b.id)).toEqual(['first-star', 'generous']);
+  it('under FOCUS_MODE drops locked badges whose next step is on a hidden surface, keeps earned ones', () => {
+    // Four Weeks (quests) and Generous (tips) are locked dead ends; Verified is earned → stays.
+    expect(visibleBadges(badges, true).map((b) => b.id)).toEqual([
+      'firstStar',
+      'connector',
+      'constellation',
+      'verified',
+    ]);
   });
 });
 
 // ── Event folds — pure ────────────────────────────────────────────────────────
 
-const claimed = (from: string, claimer: string) => ({
+const claimed = (from: string, claimer: string, id = 1) => ({
   topics: [EVENTS.VOUCH, 'claimed'],
-  data: [1, from, claimer],
+  data: [BigInt(id), from, claimer],
 });
 
 describe('foldVouchEdges', () => {
-  it('counts unique inbound and outbound edges separately', () => {
+  it('collects the distinct people on each side of the address', () => {
     const events = [
       claimed('A', 'ME'),
       claimed('B', 'ME'),
-      claimed('A', 'ME'), // duplicate edge — counted once
+      claimed('A', 'ME', 2), // repeat pair — one person
       claimed('ME', 'C'),
-      claimed('ME', 'C'), // duplicate — counted once
+      claimed('ME', 'C', 3), // repeat pair — one person
       claimed('ME', 'D'),
+      claimed('X', 'Y'), // someone else's edge
     ];
     expect(foldVouchEdges(events, 'ME')).toEqual({
-      backedBy: 2,
-      vouchedFor: 2,
-      firstBacker: 'A',
+      vouchedBy: ['A', 'B'],
+      vouchedFor: ['C', 'D'],
+      firstVoucher: 'A',
     });
   });
 
-  it('ignores other events and malformed payloads', () => {
+  it('ignores other events, minted/slashed cards and malformed payloads', () => {
     const events = [
-      { topics: [EVENTS.SOCIAL, 'ME'], data: [5, 50] }, // social xp event
-      { topics: [EVENTS.VOUCH, 'minted'], data: [2, 'A', 'ME'] }, // unclaimed mint
-      { topics: [EVENTS.VOUCH, 'claimed'], data: 'junk' }, // malformed
-      claimed('A', 'ME'),
+      { topics: [EVENTS.SOCIAL, 'ME'], data: [5n, 50n] },
+      { topics: [EVENTS.VOUCH, 'minted'], data: [2n, 'A'] },
+      { topics: [EVENTS.VOUCH, 'slashed'], data: [2n, 'ME', 10n] },
+      { topics: [EVENTS.VOUCH, 'claimed'], data: 'junk' },
+      { topics: [EVENTS.VOUCH, 'claimed'], data: [3n, 'A'] },
+      claimed('B', 'ME'),
     ];
-    expect(foldVouchEdges(events, 'ME')).toEqual({ backedBy: 1, vouchedFor: 0, firstBacker: 'A' });
+    expect(foldVouchEdges(events, 'ME')).toEqual({ vouchedBy: ['B'], vouchedFor: [], firstVoucher: 'B' });
   });
 
   it('ignores self-vouch edges defensively', () => {
-    const events = [claimed('ME', 'ME')];
-    expect(foldVouchEdges(events, 'ME')).toEqual({ backedBy: 0, vouchedFor: 0, firstBacker: undefined });
+    expect(foldVouchEdges([claimed('ME', 'ME')], 'ME')).toEqual({
+      vouchedBy: [],
+      vouchedFor: [],
+      firstVoucher: undefined,
+    });
   });
 
-  it('keeps the OLDEST backer as firstBacker (events are oldest-first)', () => {
-    const events = [claimed('A', 'ME'), claimed('B', 'ME'), claimed('C', 'ME')];
-    expect(foldVouchEdges(events, 'ME').firstBacker).toBe('A');
+  it('keeps the OLDEST voucher as first (events are oldest-first)', () => {
+    expect(foldVouchEdges([claimed('A', 'ME'), claimed('B', 'ME')], 'ME').firstVoucher).toBe('A');
   });
 });
 
 describe('foldTips', () => {
-  // Canonical tipped shape: topics ('tipped', from, to) · data amount (packages/shared).
-  const tipped = (from: string, to: string) => ({
-    topics: [EVENTS.TIPPED, from, to],
-    data: 1_000_000,
-  });
+  // Canonical shape: topics ('tipped', from, to) · data amount.
+  const tipped = (from: string, to: string) => ({ topics: [EVENTS.TIPPED, from, to], data: 1_000_000n });
 
   it('detects a tip sent and keeps the first recipient', () => {
-    const events = [tipped('ME', 'B'), tipped('ME', 'C'), tipped('A', 'ME')];
-    expect(foldTips(events, 'ME')).toEqual({ tipped: true, firstRecipient: 'B' });
+    expect(foldTips([tipped('ME', 'B'), tipped('ME', 'C')], 'ME')).toEqual({ tipped: true, firstTipTo: 'B' });
   });
 
   it('reports no tip when the address only RECEIVED tips', () => {
-    const events = [tipped('A', 'ME')];
-    expect(foldTips(events, 'ME')).toEqual({ tipped: false, firstRecipient: undefined });
+    expect(foldTips([tipped('A', 'ME')], 'ME')).toEqual({ tipped: false });
   });
 
-  it('ignores non-tip events', () => {
-    const events = [{ topics: [EVENTS.SOCIAL, 'ME'], data: [1, 2] }];
-    expect(foldTips(events, 'ME').tipped).toBe(false);
+  it('ignores non-tip and short-topic events', () => {
+    expect(foldTips([{ topics: [EVENTS.REWARD, 'ME'], data: [1, 2n, 1] }], 'ME').tipped).toBe(false);
+    expect(foldTips([{ topics: [EVENTS.TIPPED, 'ME'], data: 1n }], 'ME').tipped).toBe(false);
   });
 });
 
-// ── Snapshot merge (monotone across the ~24h RPC event window) ────────────────
+// ── Snapshot merge (the ~12h RPC window rolls; the people seen stay) ──────────
 
 describe('mergeBadgeSnapshot', () => {
-  it('keeps the max of each count (edges can only be added)', () => {
-    expect(
-      mergeBadgeSnapshot({ backedBy: 3, vouchedFor: 1, tipped: false }, { backedBy: 5, vouchedFor: 0 }),
-    ).toMatchObject({ backedBy: 5, vouchedFor: 1 });
+  const snap = (over: Partial<Parameters<typeof mergeBadgeSnapshot>[1]> = {}) => ({
+    vouchedBy: [],
+    vouchedFor: [],
+    tipped: false,
+    ...over,
   });
 
-  it('sticky-flags tips and preserves known names', () => {
-    expect(
-      mergeBadgeSnapshot(
-        { backedBy: 0, vouchedFor: 0, tipped: false },
-        { tipped: true, firstBacker: 'alice', firstTippedName: 'bob' },
-      ),
-    ).toMatchObject({ tipped: true, firstBacker: 'alice', firstTippedName: 'bob' });
+  it('UNIONS people across windows (a max of counts would undercount)', () => {
+    const merged = mergeBadgeSnapshot(snap({ vouchedBy: ['A', 'B', 'C'] }), snap({ vouchedBy: ['C', 'D', 'E'] }));
+    expect(merged.vouchedBy).toEqual(['A', 'B', 'C', 'D', 'E']);
   });
 
-  it('prefers the fresh firstBacker when both windows saw one', () => {
-    expect(
-      mergeBadgeSnapshot(
-        { backedBy: 1, vouchedFor: 0, tipped: false, firstBacker: 'carol' },
-        { firstBacker: 'alice' },
-      ).firstBacker,
-    ).toBe('carol');
+  it('keeps the earlier first voucher / first tip recipient over a later window', () => {
+    const merged = mergeBadgeSnapshot(
+      snap({ vouchedBy: ['A'], firstVoucher: 'A', tipped: true, firstTipTo: 'B' }),
+      snap({ vouchedBy: ['C'], firstVoucher: 'C', tipped: true, firstTipTo: 'D' }),
+    );
+    expect(merged).toMatchObject({ firstVoucher: 'A', firstTipTo: 'B', tipped: true });
+  });
+
+  it('keeps a tip once seen, and takes the fresh window when nothing was stored', () => {
+    expect(mergeBadgeSnapshot(snap({ tipped: true, firstTipTo: 'B' }), snap()).tipped).toBe(true);
+    const fresh = snap({ vouchedBy: ['A'], firstVoucher: 'A' });
+    expect(mergeBadgeSnapshot(null, fresh)).toEqual(fresh);
   });
 });
 
-// ── getBadges end-to-end (mocked RPC + contract reads) ────────────────────────
+describe('readBadgeSnapshot', () => {
+  beforeEach(() => localStorage.clear());
 
-vi.mock('./events', () => ({
-  fetchReputationEvents: vi.fn(async () => []),
-  fetchRewardsEvents: vi.fn(async () => []),
-}));
+  it('returns null for a missing, corrupt or wrong-shaped entry', () => {
+    expect(readBadgeSnapshot('ME')).toBeNull();
+    localStorage.setItem('alvinmunk.badges.ME', '{not json');
+    expect(readBadgeSnapshot('ME')).toBeNull();
+    localStorage.setItem('alvinmunk.badges.ME', JSON.stringify({ backedBy: 3, vouchedFor: 1 }));
+    expect(readBadgeSnapshot('ME')).toBeNull();
+  });
+});
 
-vi.mock('./reputation', () => ({
-  getProfile: vi.fn(async () => ({ social: 0, earned: 0, verified: false })),
-}));
-
-vi.mock('./quests', () => ({
-  getStreak: vi.fn(async () => ({ weeks: 0, best: 0, lastWeek: 0 })),
-}));
-
-vi.mock('./registry', () => ({
-  reverseHandle: vi.fn(async () => null),
-}));
-
-import { getBadges } from './badges';
-import { fetchReputationEvents, fetchRewardsEvents } from './events';
-import { getProfile } from './reputation';
-import { getStreak } from './quests';
-import { reverseHandle } from './registry';
+// ── getBadges end-to-end (mocked reads) ───────────────────────────────────────
 
 describe('getBadges', () => {
   beforeEach(() => {
     localStorage.clear();
-    vi.mocked(fetchReputationEvents).mockResolvedValue([]);
-    vi.mocked(fetchRewardsEvents).mockResolvedValue([]);
-    vi.mocked(getProfile).mockResolvedValue({ social: 0, earned: 0, verified: false });
-    vi.mocked(getStreak).mockResolvedValue({ weeks: 0, best: 0, lastWeek: 0 });
-    vi.mocked(reverseHandle).mockResolvedValue(null);
+    fetchReputationEventsMock.mockReset().mockResolvedValue([]);
+    fetchTipsSentMock.mockReset().mockResolvedValue([]);
+    getProfileMock.mockReset().mockResolvedValue({ social: 0, earned: 0, verified: false });
+    getStreakMock.mockReset().mockResolvedValue({ weeks: 0, best: 0, lastWeek: 0 });
+    reverseHandleMock.mockReset().mockResolvedValue(null);
   });
 
-  afterEach(() => {
-    localStorage.clear();
-    vi.restoreAllMocks();
-  });
-
-  it('folds events + on-chain reads into badges and resolves @handles', async () => {
-    vi.mocked(fetchReputationEvents).mockResolvedValue([
-      claimed('GBACKER'.padEnd(56, 'A'), 'ME'),
-    ]);
-    vi.mocked(getProfile).mockResolvedValue({ social: 30, earned: 10, verified: true });
-    vi.mocked(reverseHandle).mockResolvedValue('alice');
+  it('folds events + on-chain reads for the given address and names people by @handle', async () => {
+    fetchReputationEventsMock.mockResolvedValue([claimed('GALICE', 'ME')]);
+    fetchTipsSentMock.mockResolvedValue([{ topics: [EVENTS.TIPPED, 'ME', 'GBOB'], data: 5n }]);
+    getProfileMock.mockResolvedValue({ social: 30, earned: 10, verified: true });
+    getStreakMock.mockResolvedValue({ weeks: 4, best: 4, lastWeek: 1 });
+    reverseHandleMock.mockImplementation(async (a: string) => (a === 'GALICE' ? 'alice' : null));
 
     const badges = await getBadges('ME');
-    const first = badges.find((b) => b.id === 'first-star')!;
-    const verified = badges.find((b) => b.id === 'verified')!;
 
-    expect(first.earned).toBe(true);
-    expect(first.namedBy).toBe('alice');
-    expect(verified.earned).toBe(true);
+    expect(find(badges, 'firstStar')).toMatchObject({ earned: true, person: alice });
+    expect(find(badges, 'generous')).toMatchObject({ earned: true, person: { address: 'GBOB', handle: null } });
+    expect(find(badges, 'verified').earned).toBe(true);
+    expect(find(badges, 'fourWeeks').earned).toBe(true);
+    // Every read is for the profile owner; streak is the wallet-free read (no source).
+    expect(fetchTipsSentMock).toHaveBeenCalledWith('ME');
+    expect(getProfileMock).toHaveBeenCalledWith('ME');
+    expect(getStreakMock).toHaveBeenCalledWith('ME');
   });
 
-  it('survives the RPC event window via the localStorage snapshot', async () => {
-    vi.mocked(fetchReputationEvents).mockResolvedValue([claimed('A', 'ME'), claimed('B', 'ME')]);
-    await getBadges('ME'); // first pass persists the snapshot
+  it('survives the RPC window rolling over via the per-address snapshot', async () => {
+    fetchReputationEventsMock.mockResolvedValue([claimed('A', 'ME'), claimed('B', 'ME')]);
+    await getBadges('ME');
 
-    // Later: the event window rolled over and returns nothing.
-    vi.mocked(fetchReputationEvents).mockResolvedValue([]);
+    fetchReputationEventsMock.mockResolvedValue([claimed('C', 'ME')]); // A and B left the window
     const badges = await getBadges('ME');
-    expect(badges.find((b) => b.id === 'first-star')!.earned).toBe(true);
+    expect(find(badges, 'constellation').remaining).toBe(THRESHOLDS.CONSTELLATION - 3);
+    expect(find(badges, 'firstStar').person?.address).toBe('A');
   });
 
-  it('degrades to all-locked badges when every source fails', async () => {
-    vi.mocked(fetchReputationEvents).mockRejectedValue(new Error('rpc down'));
-    vi.mocked(fetchRewardsEvents).mockRejectedValue(new Error('rpc down'));
-    vi.mocked(getProfile).mockRejectedValue(new Error('not deployed'));
-    vi.mocked(getStreak).mockRejectedValue(new Error('not deployed'));
-    vi.mocked(reverseHandle).mockRejectedValue(new Error('not deployed'));
+  it("never mixes one address's history into another's (viewer vs profile owner)", async () => {
+    // The viewer's own dashboard persisted five backed people and a tip.
+    fetchReputationEventsMock.mockResolvedValue(['P1', 'P2', 'P3', 'P4', 'P5'].map((p) => claimed('VIEWER', p)));
+    fetchTipsSentMock.mockResolvedValue([{ topics: [EVENTS.TIPPED, 'VIEWER', 'P1'], data: 1n }]);
+    expect(find(await getBadges('VIEWER'), 'connector').earned).toBe(true);
 
-    const badges = await getBadges('ME');
-    expect(badges).toHaveLength(6);
-    expect(badges.every((b) => !b.earned)).toBe(true);
+    // Then they open someone else's profile: nothing of theirs may leak in.
+    fetchReputationEventsMock.mockResolvedValue([]);
+    fetchTipsSentMock.mockResolvedValue([]);
+    const owner = await getBadges('OWNER');
+    expect(owner.every((b) => !b.earned)).toBe(true);
+    expect(readBadgeSnapshot('OWNER')).toEqual({
+      vouchedBy: [],
+      vouchedFor: [],
+      firstVoucher: undefined,
+      tipped: false,
+      firstTipTo: undefined,
+    });
+  });
+
+  it('treats a failed streak read as no streak', async () => {
+    getStreakMock.mockRejectedValue(new Error('quest registry not deployed'));
+    expect(find(await getBadges('ME'), 'fourWeeks')).toMatchObject({ earned: false, remaining: 4 });
+  });
+
+  it('rejects when get_profile fails, instead of showing fake all-locked badges', async () => {
+    getProfileMock.mockRejectedValue(new Error('rpc down'));
+    await expect(getBadges('ME')).rejects.toThrow('rpc down');
   });
 });
